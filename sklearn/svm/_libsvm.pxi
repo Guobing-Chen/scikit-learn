@@ -12,7 +12,8 @@ cdef extern from "_svm_cython_blas_helpers.h":
         dgemv_func dgemv
 
 cdef extern from "svm.h":
-    cdef struct svm_node
+    cdef struct svm_fp64_node
+    cdef struct svm_bf16_node
     cdef struct svm_model
     cdef struct svm_parameter:
         int svm_type
@@ -40,8 +41,10 @@ cdef extern from "svm.h":
         int l1
         int l2
         double *y
-        svm_node *x
+        svm_fp64_node *svm_fp64_x
+        svm_bf16_node *svm_bf16_x
         double *W # instance weights
+        int data_mode
 
     char *svm_check_parameter(svm_problem *, svm_parameter *)
     svm_model *svm_train(svm_problem *, svm_parameter *, int *, BlasFunctions *) nogil
@@ -51,7 +54,7 @@ cdef extern from "svm.h":
 
 cdef extern from "libsvm_helper.c":
     # this file contains methods for accessing libsvm 'hidden' fields
-    svm_node **dense_to_sparse (char *, np.npy_intp *)
+    svm_fp64_node **dense_to_sparse (char *, np.npy_intp *)
     void set_parameter (svm_parameter *, int , int , int , double, double ,
                                   double , double , double , double,
                                   double, int, int, int, char *, char *, int,

@@ -8,12 +8,26 @@ extern "C" {
 #endif
 #include "_svm_cython_blas_helpers.h"
 
-struct svm_node
+
+// For those BF16 based BLAS APIs from openblas
+#include "cblas.h"
+#define DATA_MODE_FP64 0
+#define DATA_MODE_BF16 1
+
+struct svm_fp64_node
 {
 	int dim;
 	int ind; /* index. A bit redundant, but needed if using a
                     precomputed kernel */
 	double *values;
+};
+
+struct svm_bf16_node
+{
+    int dim;
+    int ind; /* index. A bit redundant, but needed if using a
+                precomputed kernel */
+    bfloat16 *values;
 };
 
 struct svm_problem
@@ -22,8 +36,10 @@ struct svm_problem
     int l1;
     int l2;
 	double *y;
-	struct svm_node *x;
+	struct svm_fp64_node *svm_fp64_x;
+	struct svm_bf16_node *svm_bf16_x;
 	double *W; /* instance weights */
+	int data_mode;
 };
 
 
@@ -37,7 +53,7 @@ struct svm_csr_problem
 {
 	int l;
 	double *y;
-	struct svm_csr_node **x;
+	struct svm_csr_node **svm_csr_x;
         double *W; /* instance weights */
 };
 
@@ -76,7 +92,9 @@ struct svm_model
 	struct svm_parameter param;	/* parameter */
 	int nr_class;		/* number of classes, = 2 in regression/one class svm */
 	int l;			/* total #SV */
-	struct svm_node *SV;		/* SVs (SV[l]) */
+	int data_mode;
+	struct svm_fp64_node *svm_fp64_SV;		/* SVs (SV[l]) */
+	struct svm_bf16_node *svm_bf16_SV;		/* SVs (SV[l]) */
 	double **sv_coef;	/* coefficients for SVs in decision functions (sv_coef[k-1][l]) */
 	double * sv_square;
 
@@ -102,7 +120,7 @@ struct svm_csr_model
 	struct svm_parameter param;	/* parameter */
 	int nr_class;		/* number of classes, = 2 in regression/one class svm */
 	int l;			/* total #SV */
-	struct svm_csr_node **SV;		/* SVs (SV[l]) */
+	struct svm_csr_node **svm_csr_SV;		/* SVs (SV[l]) */
 	double **sv_coef;	/* coefficients for SVs in decision functions (sv_coef[k-1][l]) */
 
         int *sv_ind;            /* index of support vectors */
@@ -122,32 +140,33 @@ struct svm_csr_model
 };
 
 
-struct svm_model *svm_train(const struct svm_problem *prob, const struct svm_parameter *param, int *status, BlasFunctions *blas_functions);
-void svm_cross_validation(const struct svm_problem *prob, const struct svm_parameter *param, int nr_fold, double *target, BlasFunctions *blas_functions);
 
+/* dense version */
 int svm_save_model(const char *model_file_name, const struct svm_model *model);
 struct svm_model *svm_load_model(const char *model_file_name);
-
 int svm_get_svm_type(const struct svm_model *model);
 int svm_get_nr_class(const struct svm_model *model);
 void svm_get_labels(const struct svm_model *model, int *label);
 double svm_get_svr_probability(const struct svm_model *model);
-
-double svm_predict_values(const struct svm_model *model, const struct svm_node *x, double* dec_values, BlasFunctions *blas_functions);
-double svm_predict(const struct svm_model *model, const struct svm_node *x, BlasFunctions *blas_functions);
-double svm_predict_probability(const struct svm_model *model, const struct svm_node *x, double* prob_estimates, BlasFunctions *blas_functions);
-
 void svm_free_model_content(struct svm_model *model_ptr);
 void svm_free_and_destroy_model(struct svm_model **model_ptr_ptr);
 void svm_destroy_param(struct svm_parameter *param);
-
 const char *svm_check_parameter(const struct svm_problem *prob, const struct svm_parameter *param);
-
 void svm_set_print_string_function(void (*print_func)(const char *));
+
+struct svm_model *svm_train(struct svm_problem *prob, const struct svm_parameter *param, int *status, BlasFunctions *blas_functions);
+void svm_cross_validation(const struct svm_problem *prob, const struct svm_parameter *param, int nr_fold, double *target, BlasFunctions *blas_functions);
+
+double svm_fp64_predict_values(const struct svm_model *model, const struct svm_fp64_node *x, double* dec_values, BlasFunctions *blas_functions);
+double svm_fp64_predict(const struct svm_model *model, const struct svm_fp64_node *x, BlasFunctions *blas_functions);
+double svm_fp64_predict_probability(const struct svm_model *model, const struct svm_fp64_node *x, double* prob_estimates, BlasFunctions *blas_functions);
+double svm_bf16_predict_values(const struct svm_model *model, const struct svm_bf16_node *x, double* dec_values, BlasFunctions *blas_functions);
+double svm_bf16_predict(const struct svm_model *model, const struct svm_bf16_node *x, BlasFunctions *blas_functions);
+double svm_bf16_predict_probability(const struct svm_model *model, const struct svm_bf16_node *x, double* prob_estimates, BlasFunctions *blas_functions);
+/* end dense version */
 
 
 /* sparse version */
-
 struct svm_csr_model *svm_csr_train(const struct svm_csr_problem *prob, const struct svm_parameter *param, int *status, BlasFunctions *blas_functions);
 void svm_csr_cross_validation(const struct svm_csr_problem *prob, const struct svm_parameter *param, int nr_fold, double *target, BlasFunctions *blas_functions);
 

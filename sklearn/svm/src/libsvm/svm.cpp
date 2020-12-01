@@ -70,8 +70,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "_svm_cython_blas_helpers.h"
 #include "../newrand/newrand.h"
 
+
 #ifndef _LIBSVM_CPP
-typedef double Qfloat;
 typedef signed char schar;
 #ifndef min
 template <class T> static inline T min(T x,T y) { return (x<y)?x:y; }
@@ -116,33 +116,46 @@ static void info(const char *fmt,...)
 	va_end(ap);
 	(*svm_print_string)(buf);
 }
+
+/* Below functions need to be declared firstly due to the order of instantial in libsvm_template.cpp */
+static void svm_bf16_remove_zero_weight(svm_problem *newprob, const svm_problem *prob, bool compress_flag);
+void svm_bf16_cross_validation(const svm_problem *prob, const svm_parameter *param, int nr_fold, double *target, BlasFunctions *blas_functions);
+svm_model *svm_bf16_train(svm_problem *prob, const svm_parameter *param, int *status, BlasFunctions *blas_functions);
+
 #endif
 #define _LIBSVM_CPP
 
 
 /* yeah, this is ugly.  It helps us to have unique names for both sparse
 and dense versions of this library */
-#ifdef _DENSE_REP
-  #ifdef PREFIX
-    #undef PREFIX  
-  #endif
-  #ifdef NAMESPACE
-    #undef NAMESPACE
-  #endif
-  #define PREFIX(name) svm_##name
-  #define NAMESPACE svm
-  namespace svm {
+#ifdef _DENSE_FP64
+	#undef  PREFIX
+	#define PREFIX(name) svm_##name
+	#undef  PREFIX_D
+	#define PREFIX_D(name) svm_fp64_##name
+	#undef  NAMESPACE
+	#define NAMESPACE svm_fp64
+namespace svm_fp64 {
+typedef double Qfloat;
+#elif defined(_DENSE_BF16)
+	#undef  PREFIX
+	#define PREFIX(name) svm_##name
+	#undef  PREFIX_D
+	#define PREFIX_D(name) svm_bf16_##name
+	#undef  NAMESPACE
+	#define NAMESPACE svm_bf16
+namespace svm_bf16 {
+typedef float Qfloat;
 #else
-  /* sparse representation */
-  #ifdef PREFIX
-    #undef PREFIX  
-  #endif
-  #ifdef NAMESPACE
-    #undef NAMESPACE
-  #endif
-  #define PREFIX(name) svm_csr_##name
-  #define NAMESPACE svm_csr
-  namespace svm_csr {
+/* sparse representation */
+	#undef  PREFIX
+	#define PREFIX(name) svm_csr_##name
+	#undef  PREFIX_D
+	#define PREFIX_D(name) svm_csr_##name
+	#undef  NAMESPACE
+	#define NAMESPACE svm_csr
+namespace svm_csr {
+typedef double Qfloat;
 #endif
 
 
@@ -289,17 +302,20 @@ public:
 
 class Kernel: public QMatrix {
 public:
-#ifdef _DENSE_REP
-	Kernel(int l, PREFIX(node) * x, const svm_parameter& param, BlasFunctions *blas_functions);
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+	Kernel(int l, PREFIX_D(node) * x, const svm_parameter& param, BlasFunctions *blas_functions);
 #else
-	Kernel(int l, PREFIX(node) * const * x, const svm_parameter& param, BlasFunctions *blas_functions);
+	Kernel(int l, PREFIX_D(node) * const * x, const svm_parameter& param, BlasFunctions *blas_functions);
 #endif
 	virtual ~Kernel();
 
-	static double k_function(const PREFIX(node) *x, const PREFIX(node) *y,
+	static double k_function(const PREFIX_D(node) *x, const PREFIX_D(node) *y,
 				 const svm_parameter& param, BlasFunctions *blas_functions);
-#ifdef _DENSE_REP
-	static void k_gemv_function(int l, double param, const svm_node *x, double *SV, double* kvalue, BlasFunctions *blas_functions);
+
+#ifdef _DENSE_FP64
+	static void k_gemv_function(int l, double param, const svm_fp64_node *x, double *SV, double* kvalue, BlasFunctions *blas_functions);
+#elif defined(_DENSE_BF16)
+	static void k_gemv_function(int l, double param, const svm_bf16_node *x, const bfloat16 *SV, float* kvalue, BlasFunctions *blas_functions);
 #endif
 	virtual Qfloat *get_Q(int column, int len) const = 0;
 	virtual double *get_QD() const = 0;
@@ -311,8 +327,8 @@ public:
 protected:
 
 	double (Kernel::*kernel_function)(int i, int j) const;
-#ifdef _DENSE_REP
-	void kernel_gemv_function(int index, double* data, int l1, int l2) const
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+	void kernel_gemv_function(int index, Qfloat* data, int l1, int l2) const
 	{
 		int dim = x[index].dim;
 		int length = l1 + l2;
@@ -323,12 +339,23 @@ protected:
             data[j] = x_square[index] + x_square[j];
 		}
 
+#ifdef _DENSE_FP64
 		m_blas->dscal(length, -gamma, data, 1);
-
-		if(l1 > 0)
+		if(l1 > 0) {
 			m_blas->dgemv(RowMajor, NoTrans, l1, dim, 2.0*gamma, x[0].values, dim, x[index].values, 1, 1, data, 1);
-		if(l2 > 0)
+		}
+		if(l2 > 0) {
 			m_blas->dgemv(RowMajor, NoTrans, l2, dim, 2.0*gamma, x[l1].values, dim, x[index].values, 1, 1, data+l1, 1);
+		}
+#elif defined(_DENSE_BF16)
+		cblas_sscal(length, -gamma, data, 1);
+		if(l1 > 0) {
+			cblas_sbgemv(CblasRowMajor, CblasNoTrans, l1, dim, 2.0*gamma, x[0].values, dim, x[index].values, 1, 1, data, 1);
+		}
+		if(l2 > 0) {
+			cblas_sbgemv(CblasRowMajor, CblasNoTrans, l2, dim, 2.0*gamma, x[l1].values, dim, x[index].values, 1, 1, data+l1, 1);
+		}
+#endif
 		for(int i=0; i<length; i++) {
             data[i]= exp(data[i]);
 		}
@@ -336,10 +363,10 @@ protected:
 #endif
 
 private:
-#ifdef _DENSE_REP
-	PREFIX(node) *x;
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+	PREFIX_D(node) *x;
 #else
-	const PREFIX(node) **x;
+	const PREFIX_D(node) **x;
 #endif
 	double *x_square;
 	// scipy blas pointer
@@ -351,9 +378,9 @@ private:
 	const double gamma;
 	const double coef0;
 
-	static double dot(const PREFIX(node) *px, const PREFIX(node) *py, BlasFunctions *blas_functions);
-#ifdef _DENSE_REP
-	static double dot(const PREFIX(node) &px, const PREFIX(node) &py, BlasFunctions *blas_functions);
+	static double dot(const PREFIX_D(node) *px, const PREFIX_D(node) *py, BlasFunctions *blas_functions);
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+	static double dot(const PREFIX_D(node) &px, const PREFIX_D(node) &py, BlasFunctions *blas_functions);
 #endif
 
 	double kernel_linear(int i, int j) const
@@ -374,7 +401,7 @@ private:
 	}
 	double kernel_precomputed(int i, int j) const
 	{
-#ifdef _DENSE_REP
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
 		return (x+i)->values[x[j].ind];
 #else
 		return x[i][(int)(x[j][0].value)].value;
@@ -382,10 +409,10 @@ private:
 	}
 };
 
-#ifdef _DENSE_REP
-Kernel::Kernel(int l, PREFIX(node) * x_, const svm_parameter& param, BlasFunctions *blas_functions)
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+Kernel::Kernel(int l, PREFIX_D(node) * x_, const svm_parameter& param, BlasFunctions *blas_functions)
 #else
-Kernel::Kernel(int l, PREFIX(node) * const * x_, const svm_parameter& param, BlasFunctions *blas_functions)
+Kernel::Kernel(int l, PREFIX_D(node) * const * x_, const svm_parameter& param, BlasFunctions *blas_functions)
 #endif
 :kernel_type(param.kernel_type), degree(param.degree),
  gamma(param.gamma), coef0(param.coef0)
@@ -428,26 +455,34 @@ Kernel::~Kernel()
 	delete[] x_square;
 }
 
-#ifdef _DENSE_REP
-double Kernel::dot(const PREFIX(node) *px, const PREFIX(node) *py, BlasFunctions *blas_functions)
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+double Kernel::dot(const PREFIX_D(node) *px, const PREFIX_D(node) *py, BlasFunctions *blas_functions)
 {
 	double sum = 0;
 
 	int dim = min(px->dim, py->dim);
+#if defined(_DENSE_FP64)
 	sum = blas_functions->dot(dim, px->values, 1, py->values, 1);
+#elif defined(_DENSE_BF16)
+	sum = (double) cblas_sbdot(dim, px->values, 1, py->values, 1);
+#endif
 	return sum;
 }
 
-double Kernel::dot(const PREFIX(node) &px, const PREFIX(node) &py, BlasFunctions *blas_functions)
+double Kernel::dot(const PREFIX_D(node) &px, const PREFIX_D(node) &py, BlasFunctions *blas_functions)
 {
 	double sum = 0;
 
 	int dim = min(px.dim, py.dim);
+#if defined(_DENSE_FP64)
 	sum = blas_functions->dot(dim, px.values, 1, py.values, 1);
+#elif defined(_DENSE_BF16)
+	sum = (double) cblas_sbdot(dim, px.values, 1, py.values, 1);
+#endif
 	return sum;
 }
 #else
-double Kernel::dot(const PREFIX(node) *px, const PREFIX(node) *py, BlasFunctions *blas_functions)
+double Kernel::dot(const PREFIX_D(node) *px, const PREFIX_D(node) *py, BlasFunctions *blas_functions)
 {
 	double sum = 0;
 	while(px->index != -1 && py->index != -1)
@@ -470,7 +505,7 @@ double Kernel::dot(const PREFIX(node) *px, const PREFIX(node) *py, BlasFunctions
 }
 #endif
 
-double Kernel::k_function(const PREFIX(node) *x, const PREFIX(node) *y,
+double Kernel::k_function(const PREFIX_D(node) *x, const PREFIX_D(node) *y,
 			  const svm_parameter& param, BlasFunctions *blas_functions)
 {
 	switch(param.kernel_type)
@@ -482,7 +517,7 @@ double Kernel::k_function(const PREFIX(node) *x, const PREFIX(node) *y,
 		case RBF:
 		{
 			double sum = 0;
-#ifdef _DENSE_REP
+#if defined(_DENSE_FP64)
 			int dim = min(x->dim, y->dim), i;
 			double* m_array = (double*)malloc(sizeof(double)*dim);
 			for (i = 0; i < dim; i++)
@@ -495,6 +530,19 @@ double Kernel::k_function(const PREFIX(node) *x, const PREFIX(node) *y,
 				sum += x->values[i] * x->values[i];
 			for (; i < y->dim; i++)
 				sum += y->values[i] * y->values[i];
+#elif defined(_DENSE_BF16)
+			int dim = min(x->dim, y->dim);
+
+            sum =  (double) cblas_sbdot(dim, x->values, 1, x->values, 1);
+			sum += (double) cblas_sbdot(dim, y->values, 1, y->values, 1);
+			sum -= 2 * (double) cblas_sbdot(dim, x->values, 1, y->values, 1);
+
+			if (x->dim > dim) {
+				sum += (double) cblas_sbdot(x->dim - dim, x->values+dim, 1, x->values+dim, 1);
+			}
+			if (y->dim > dim) {
+				sum += (double) cblas_sbdot(y->dim - dim, y->values+dim, 1, y->values+dim, 1);
+			}
 #else
 			while(x->index != -1 && y->index !=-1)
 			{
@@ -538,7 +586,7 @@ double Kernel::k_function(const PREFIX(node) *x, const PREFIX(node) *y,
 			return tanh(param.gamma*dot(x,y,blas_functions)+param.coef0);
 		case PRECOMPUTED:  //x: test (validation), y: SV
                     {
-#ifdef _DENSE_REP
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
 			return x->values[y->ind];
 #else
 			return x[(int)(y->value)].value;
@@ -549,8 +597,8 @@ double Kernel::k_function(const PREFIX(node) *x, const PREFIX(node) *y,
 	}
 }
 
-#ifdef _DENSE_REP
-void Kernel::k_gemv_function(int length, double gamma, const svm_node *x, double *SV, double* kvalue, BlasFunctions *blas_functions){
+#if defined(_DENSE_FP64)
+void Kernel::k_gemv_function(int length, double gamma, const svm_fp64_node *x, double *SV, double* kvalue, BlasFunctions *blas_functions){
 	int dim = x->dim;
 
 	double sumx = blas_functions->dot(dim, x[0].values, 1, x[0].values, 1);
@@ -562,6 +610,21 @@ void Kernel::k_gemv_function(int length, double gamma, const svm_node *x, double
 	blas_functions->dgemv(RowMajor, NoTrans, length, dim, 2.0*gamma, SV, dim, x[0].values, 1, 1, kvalue, 1);
 
 	for(int i =0; i<length; i++){
+		kvalue[i]= exp(kvalue[i]);
+	}
+}
+#elif defined(_DENSE_BF16)
+void Kernel::k_gemv_function(int length, double gamma, const svm_bf16_node *x, const bfloat16 *SV, float* kvalue, BlasFunctions *blas_functions){
+	int dim = x->dim;
+
+	float sumx = cblas_sbdot(dim, x[0].values, 1, x[0].values, 1);
+	for (int j=0; j<length; j++) {
+		kvalue[j] += sumx;
+	}
+	cblas_sscal(length, -1 * gamma, kvalue, 1);
+	cblas_sbgemv(CblasRowMajor, CblasNoTrans, length, dim, 2.0*gamma, SV, dim, x[0].values, 1, 1, kvalue, 1);
+
+	for (int i =0; i<length; i++) {
 		kvalue[i]= exp(kvalue[i]);
 	}
 }
@@ -1460,14 +1523,14 @@ class SVC_Q: public Kernel
 { 
 public:
 	SVC_Q(const PREFIX(problem)& prob, const svm_parameter& param, const schar *y_, BlasFunctions *blas_functions)
-	:Kernel(prob.l, prob.x, param, blas_functions)
+	:Kernel(prob.l, prob.PREFIX_D(x), param, blas_functions)
 	{
 		clone(y,y_,prob.l);
 		cache = new Cache(prob.l,(long int)(param.cache_size*(1<<20)));
 		QD = new double[prob.l];
 		for(int i=0;i<prob.l;i++)
 			QD[i] = (this->*kernel_function)(i,i);
-#ifdef _DENSE_REP
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
 		this->shrinking = param.shrinking;
 		this->l1 = prob.l1;
 		this->l2 = prob.l2;
@@ -1481,7 +1544,7 @@ public:
 		int start, j;
 
 		start = cache->get_data(i, &data, len);
-#ifdef _DENSE_REP
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
 		if (shrinking==0 && kernel_type==RBF) {
             if (start < len) {
                 kernel_gemv_function(i, data, l1, l2);
@@ -1496,7 +1559,7 @@ public:
                     data[j] = (Qfloat)(y[i] * y[j] * (this->*kernel_function)(i,j));
 				}
 			}
-#ifdef _DENSE_REP
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
 		}
 #endif
 		return data;
@@ -1522,7 +1585,7 @@ public:
 		delete[] QD;
 	}
 private:
-#ifdef _DENSE_REP
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
     int shrinking;
     int l1;
     int l2;
@@ -1537,7 +1600,7 @@ class ONE_CLASS_Q: public Kernel
 {
 public:
 	ONE_CLASS_Q(const PREFIX(problem)& prob, const svm_parameter& param, BlasFunctions *blas_functions)
-	:Kernel(prob.l, prob.x, param, blas_functions)
+	:Kernel(prob.l, prob.PREFIX_D(x), param, blas_functions)
 	{
 		cache = new Cache(prob.l,(long int)(param.cache_size*(1<<20)));
 		QD = new double[prob.l];
@@ -1583,7 +1646,7 @@ class SVR_Q: public Kernel
 { 
 public:
 	SVR_Q(const PREFIX(problem)& prob, const svm_parameter& param, BlasFunctions *blas_functions)
-	:Kernel(prob.l, prob.x, param, blas_functions)
+	:Kernel(prob.l, prob.PREFIX_D(x), param, blas_functions)
 	{
 		l = prob.l;
 		cache = new Cache(l,(long int)(param.cache_size*(1<<20)));
@@ -2189,10 +2252,10 @@ static void svm_binary_svc_probability(
 		struct PREFIX(problem) subprob;
 
 		subprob.l = prob->l-(end-begin);
-#ifdef _DENSE_REP
-		subprob.x = Malloc(struct PREFIX(node),subprob.l);
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+		subprob.PREFIX_D(x) = Malloc(struct PREFIX_D(node),subprob.l);
 #else
-		subprob.x = Malloc(struct PREFIX(node)*,subprob.l);
+		subprob.PREFIX_D(x) = Malloc(struct PREFIX_D(node)*,subprob.l);
 #endif
 		subprob.y = Malloc(double,subprob.l);
                 subprob.W = Malloc(double,subprob.l);
@@ -2200,14 +2263,14 @@ static void svm_binary_svc_probability(
 		k=0;
 		for(j=0;j<begin;j++)
 		{
-			subprob.x[k] = prob->x[perm[j]];
+			subprob.PREFIX_D(x)[k] = prob->PREFIX_D(x)[perm[j]];
 			subprob.y[k] = prob->y[perm[j]];
 			subprob.W[k] = prob->W[perm[j]];
 			++k;
 		}
 		for(j=end;j<prob->l;j++)
 		{
-			subprob.x[k] = prob->x[perm[j]];
+			subprob.PREFIX_D(x)[k] = prob->PREFIX_D(x)[perm[j]];
 			subprob.y[k] = prob->y[perm[j]];
 			subprob.W[k] = prob->W[perm[j]];
 			++k;
@@ -2241,12 +2304,11 @@ static void svm_binary_svc_probability(
 			subparam.weight[0]=Cp;
 			subparam.weight[1]=Cn;
 			struct PREFIX(model) *submodel = PREFIX(train)(&subprob,&subparam, status, blas_functions);
-			for(j=begin;j<end;j++)
-			{
-#ifdef _DENSE_REP
-                                PREFIX(predict_values)(submodel,(prob->x+perm[j]),&(dec_values[perm[j]]), blas_functions); 
+			for(j=begin;j<end;j++) {
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+				PREFIX_D(predict_values)(submodel,(prob->PREFIX_D(x)+perm[j]),&(dec_values[perm[j]]), blas_functions);
 #else
-				PREFIX(predict_values)(submodel,prob->x[perm[j]],&(dec_values[perm[j]]), blas_functions); 
+				PREFIX_D(predict_values)(submodel,prob->PREFIX_D(x)[perm[j]],&(dec_values[perm[j]]), blas_functions);
 #endif
 				// ensure +1 -1 order; reason not using CV subroutine
 				dec_values[perm[j]] *= submodel->label[0];
@@ -2254,9 +2316,9 @@ static void svm_binary_svc_probability(
 			PREFIX(free_and_destroy_model)(&submodel);
 			PREFIX(destroy_param)(&subparam);
 		}
-		free(subprob.x);
+		free(subprob.PREFIX_D(x));
 		free(subprob.y);
-                free(subprob.W);
+		free(subprob.W);
 	}		
 	sigmoid_train(prob->l,dec_values,prob->y,probA,probB);
 	free(dec_values);
@@ -2390,25 +2452,30 @@ static void svm_group_classes(const PREFIX(problem) *prob, int *nr_class_ret, in
 
 // Remove zero weighed data as libsvm and some liblinear solvers require C > 0.
 //
-static void remove_zero_weight(PREFIX(problem) *newprob, const PREFIX(problem) *prob, bool compress_flag)
+static void PREFIX_D(remove_zero_weight)(PREFIX(problem) *newprob, const PREFIX(problem) *prob, bool compress_flag)
 {
 	int i;
 	int l = 0;
 	for(i=0;i<prob->l;i++)
 		if(prob->W[i] > 0) l++;
 	newprob->l = l;
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+	newprob->data_mode = prob->data_mode;
+#endif
 
 	if (l == prob->l) {  // No data line removed, fall back to use the original prob
 		newprob->y = NULL;
 		newprob->W = NULL;
-		newprob->x = NULL;
+		newprob->PREFIX_D(x) = NULL;
 		return;
 	}
 
-#ifdef _DENSE_REP
-	newprob->x = Malloc(PREFIX(node),l);
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+	newprob->PREFIX_D(x) = Malloc(PREFIX_D(node),l);
+	newprob->l1 = prob->l1;
+	newprob->l2 = prob->l2;
 #else
-	newprob->x = Malloc(PREFIX(node) *,l);
+	newprob->PREFIX_D(x) = Malloc(PREFIX_D(node) *,l);
 #endif
 	newprob->y = Malloc(double,l);
 	newprob->W = Malloc(double,l);
@@ -2417,15 +2484,15 @@ static void remove_zero_weight(PREFIX(problem) *newprob, const PREFIX(problem) *
 	for(i=0;i<prob->l;i++)
 		if(prob->W[i] > 0)
 		{
-			newprob->x[j] = prob->x[i];
+			newprob->PREFIX_D(x)[j] = prob->PREFIX_D(x)[i];
 			newprob->y[j] = prob->y[i];
 			newprob->W[j] = prob->W[i];
 			j++;
 		}
 
-#ifdef _DENSE_REP
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
 	if (compress_flag == true) {
-		int dim = prob->x[0].dim;
+		int dim = prob->PREFIX_D(x)[0].dim;
 		int zero_w_count = 0;
 		int i = 0;
 		while (i<prob->l) {
@@ -2433,9 +2500,13 @@ static void remove_zero_weight(PREFIX(problem) *newprob, const PREFIX(problem) *
 
 			i++;
 			while(i < prob->l && prob->W[i] > 0) {
-				memcpy(prob->x[i].values, prob->x[i-1-zero_w_count].values, dim*sizeof(double));
-				prob->x[i-1-zero_w_count].dim = prob->x[i].dim;
-				prob->x[i-1-zero_w_count].ind = prob->x[i].ind;
+#if defined(_DENSE_FP64)
+				memcpy(prob->PREFIX_D(x)[i].values, prob->PREFIX_D(x)[i-1-zero_w_count].values, dim*sizeof(double));
+#elif defined(_DENSE_BF16)
+				memcpy(prob->PREFIX_D(x)[i].values, prob->PREFIX_D(x)[i-1-zero_w_count].values, dim*sizeof(bfloat16));
+#endif
+				prob->PREFIX_D(x)[i-1-zero_w_count].dim = prob->PREFIX_D(x)[i].dim;
+				prob->PREFIX_D(x)[i-1-zero_w_count].ind = prob->PREFIX_D(x)[i].ind;
 				prob->y[i-1-zero_w_count] = prob->y[i];
 				prob->W[i-1-zero_w_count] = prob->W[i];
 				i++;
@@ -2444,7 +2515,7 @@ static void remove_zero_weight(PREFIX(problem) *newprob, const PREFIX(problem) *
 		}
 
 		for(i=0;i<newprob->l;i++) {
-			newprob->x[i] = prob->x[i];
+			newprob->PREFIX_D(x)[i] = prob->PREFIX_D(x)[i];
 			newprob->y[i] = prob->y[i];
 			newprob->W[i] = prob->W[i];
 		}
@@ -2452,68 +2523,93 @@ static void remove_zero_weight(PREFIX(problem) *newprob, const PREFIX(problem) *
 #endif
 }
 
-#ifdef _DENSE_REP
-static void perm_sort(svm_node *x, int *perm, int length)
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+static void PREFIX_D(perm_sort)(PREFIX_D(node) *x, int *perm, int length)
 {
-    int dim = x[0].dim;
-    int reorder_flag[length] = {0};
-    int reorder_link[length];
-    int reverse_perm[length];
+	int dim = x[0].dim;
+	int reorder_flag[length];
+	int reorder_link[length];
+	int reverse_perm[length];
 
-    double * reorder_buffer = new double[dim];
+#if defined(_DENSE_FP64)
+	double * reorder_buffer = new double[dim];
+#elif defined(_DENSE_BF16)
+	bfloat16 * reorder_buffer = new bfloat16[dim];
+#endif
 
-    // Generate the reversed perm map
-    for(int i=0; i<length; i++) {
-        reverse_perm[perm[i]] = i;
-    }
+	// Generate the reversed perm map and initialize reorder_flag
+	for(int i=0; i<length; i++) {
+		reverse_perm[perm[i]] = i;
+		reorder_flag[i] = 0;
+	}
 
-    for(int i=0; i<length; i++) {
-        // Find the first not reordered element
-        if (reorder_flag[i] == 0 && reverse_perm[i] != i) {
-            int index_link = 0;
-            int index_r_perm = i;
+	for(int i=0; i<length; i++) {
+		// Find the first not reordered element
+		if (reorder_flag[i] == 0 && reverse_perm[i] != i) {
+			int index_link = 0;
+			int index_r_perm = i;
 
-            memcpy(reorder_buffer, x[i].values, dim*sizeof(double));
-            while (1) {
-                reorder_link[index_link++] = index_r_perm;
-                reorder_flag[index_r_perm] = 1;
-                index_r_perm = reverse_perm[index_r_perm];
-                if (index_r_perm == i) {
-                    index_link --;
-                    break;
-                }
-            }
+#if defined(_DENSE_FP64)
+			memcpy(reorder_buffer, x[i].values, dim*sizeof(double));
+#elif defined(_DENSE_BF16)
+			memcpy(reorder_buffer, x[i].values, dim*sizeof(bfloat16));
+#endif
+			while (1) {
+				reorder_link[index_link++] = index_r_perm;
+				reorder_flag[index_r_perm] = 1;
+				index_r_perm = reverse_perm[index_r_perm];
+				if (index_r_perm == i) {
+					index_link --;
+					break;
+				}
+			}
 
-            memcpy(x[reorder_link[0]].values, x[reorder_link[index_link]].values, dim*sizeof(double));
-            for (; index_link > 1; index_link--) {
-                memcpy(x[reorder_link[index_link]].values, x[reorder_link[index_link-1]].values, dim*sizeof(double));
-            }
-            memcpy(x[reorder_link[1]].values, reorder_buffer, dim*sizeof(double));
-        }
-    }
+#if defined(_DENSE_FP64)
+			memcpy(x[reorder_link[0]].values, x[reorder_link[index_link]].values, dim*sizeof(double));
+			for (; index_link > 1; index_link--) {
+				memcpy(x[reorder_link[index_link]].values, x[reorder_link[index_link-1]].values, dim*sizeof(double));
+			}
+			memcpy(x[reorder_link[1]].values, reorder_buffer, dim*sizeof(double));
+#elif defined(_DENSE_BF16)
+			memcpy(x[reorder_link[0]].values, x[reorder_link[index_link]].values, dim*sizeof(bfloat16));
+			for (; index_link > 1; index_link--) {
+				memcpy(x[reorder_link[index_link]].values, x[reorder_link[index_link-1]].values, dim*sizeof(bfloat16));
+			}
+			memcpy(x[reorder_link[1]].values, reorder_buffer, dim*sizeof(bfloat16));
+#endif
+		}
+	}
 
-    delete[] reorder_buffer;
+	delete[] reorder_buffer;
 }
 #endif
 
 //
 // Interface functions
 //
-PREFIX(model) *PREFIX(train)(const PREFIX(problem) *prob, const svm_parameter *param,
-        int *status, BlasFunctions *blas_functions)
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+PREFIX(model) *PREFIX_D(train)(           PREFIX(problem) *prob, const svm_parameter *param, int *status, BlasFunctions *blas_functions)
+#else
+PREFIX(model) *PREFIX_D(fp64_train)(const PREFIX(problem) *prob, const svm_parameter *param, int *status, BlasFunctions *blas_functions)
+#endif
 {
 	PREFIX(problem) newprob;
-	remove_zero_weight(&newprob, prob, true);
+	PREFIX_D(remove_zero_weight)(&newprob, prob, true);
 	if (newprob.l != prob->l) {prob = &newprob;}
 
 	PREFIX(model) *model = Malloc(PREFIX(model),1);
 	model->param = *param;
 	model->free_sv = 0;	// XXX
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+	model->data_mode = prob->data_mode;
+	model->svm_fp64_SV = NULL;
+	model->svm_bf16_SV = NULL;
+#endif
 
-    if(param->random_seed >= 0)
-    {
-        set_seed(param->random_seed);
-    }
+	if(param->random_seed >= 0)
+	{
+		set_seed(param->random_seed);
+	}
 
 	if(param->svm_type == ONE_CLASS ||
 	   param->svm_type == EPSILON_SVR ||
@@ -2534,7 +2630,7 @@ PREFIX(model) *PREFIX(train)(const PREFIX(problem) *prob, const svm_parameter *p
 			model->probA[0] = NAMESPACE::svm_svr_probability(prob,param,blas_functions);
 		}
 
-                NAMESPACE::decision_function f = NAMESPACE::svm_train_one(prob,param,0,0, status,blas_functions);
+		NAMESPACE::decision_function f = NAMESPACE::svm_train_one(prob,param,0,0, status,blas_functions);
 		model->rho = Malloc(double,1);
 		model->rho[0] = f.rho;
 
@@ -2543,19 +2639,19 @@ PREFIX(model) *PREFIX(train)(const PREFIX(problem) *prob, const svm_parameter *p
 		for(i=0;i<prob->l;i++)
 			if(fabs(f.alpha[i]) > 0) ++nSV;
 		model->l = nSV;
-#ifdef _DENSE_REP
-		model->SV = Malloc(PREFIX(node),nSV);
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+		model->PREFIX_D(SV) = Malloc(PREFIX_D(node),nSV);
 #else
-		model->SV = Malloc(PREFIX(node) *,nSV);
+		model->PREFIX_D(SV) = Malloc(PREFIX_D(node) *,nSV);
 #endif
-                model->sv_ind = Malloc(int, nSV);
+		model->sv_ind = Malloc(int, nSV);
 		model->sv_coef[0] = Malloc(double, nSV);
 		int j = 0;
 		for(i=0;i<prob->l;i++)
 			if(fabs(f.alpha[i]) > 0)
 			{
-				model->SV[j] = prob->x[i];
-                                model->sv_ind[j] = i;
+				model->PREFIX_D(SV)[j] = prob->PREFIX_D(x)[i];
+				model->sv_ind[j] = i;
 				model->sv_coef[0][j] = f.alpha[i];
 				++j;
 			}		
@@ -2574,20 +2670,20 @@ PREFIX(model) *PREFIX(train)(const PREFIX(problem) *prob, const svm_parameter *p
 
         // group training data of the same class
         NAMESPACE::svm_group_classes(prob,&nr_class,&label,&start,&count,perm);
-#ifdef _DENSE_REP
-        perm_sort(prob->x, perm, l);
-		PREFIX(node) *x = Malloc(PREFIX(node),l);
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+        PREFIX_D(perm_sort)(prob->PREFIX_D(x), perm, l);
+		PREFIX_D(node) *x = Malloc(PREFIX_D(node),l);
 #else
-		PREFIX(node) **x = Malloc(PREFIX(node) *,l);
+		PREFIX_D(node) **x = Malloc(PREFIX_D(node) *,l);
 #endif
         double *W = Malloc(double, l);
 
         int i;
         for(i=0;i<l;i++) {
-#ifdef _DENSE_REP
-            x[i] = prob->x[i];
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+            x[i] = prob->PREFIX_D(x)[i];
 #else
-            x[i] = prob->x[perm[i]];
+            x[i] = prob->PREFIX_D(x)[perm[i]];
 #endif
             W[i] = prob->W[perm[i]];
         }
@@ -2631,31 +2727,31 @@ PREFIX(model) *PREFIX(train)(const PREFIX(problem) *prob, const svm_parameter *p
 				int si = start[i], sj = start[j];
 				int ci = count[i], cj = count[j];
 				sub_prob.l = ci+cj;
-#ifdef _DENSE_REP
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
 				sub_prob.l1 = ci;
 				sub_prob.l2 = cj;
-				sub_prob.x = Malloc(PREFIX(node),sub_prob.l);
+				sub_prob.PREFIX_D(x) = Malloc(PREFIX_D(node),sub_prob.l);
 #else
-				sub_prob.x = Malloc(PREFIX(node) *,sub_prob.l);
+				sub_prob.PREFIX_D(x) = Malloc(PREFIX_D(node) *,sub_prob.l);
 #endif
 				sub_prob.W = Malloc(double,sub_prob.l);
 				sub_prob.y = Malloc(double,sub_prob.l);
 				int k;
 				for(k=0;k<ci;k++)
 				{
-					sub_prob.x[k] = x[si+k];
+					sub_prob.PREFIX_D(x)[k] = x[si+k];
 					sub_prob.y[k] = +1;
 					sub_prob.W[k] = W[si+k];
 				}
 				for(k=0;k<cj;k++)
 				{
-					sub_prob.x[ci+k] = x[sj+k];
+					sub_prob.PREFIX_D(x)[ci+k] = x[sj+k];
 					sub_prob.y[ci+k] = -1;
 					sub_prob.W[ci+k] = W[sj+k];
 				}
 
 				if(param->probability)
-                                    NAMESPACE::svm_binary_svc_probability(&sub_prob,param,weighted_C[i],weighted_C[j],probA[p],probB[p], status, blas_functions);
+					NAMESPACE::svm_binary_svc_probability(&sub_prob,param,weighted_C[i],weighted_C[j],probA[p],probB[p], status, blas_functions);
 
 				f[p] = NAMESPACE::svm_train_one(&sub_prob,param,weighted_C[i],weighted_C[j], status, blas_functions);
 				for(k=0;k<ci;k++)
@@ -2664,9 +2760,9 @@ PREFIX(model) *PREFIX(train)(const PREFIX(problem) *prob, const svm_parameter *p
 				for(k=0;k<cj;k++)
 					if(!nonzero[sj+k] && fabs(f[p].alpha[ci+k]) > 0)
 						nonzero[sj+k] = true;
-				free(sub_prob.x);
+				free(sub_prob.PREFIX_D(x));
 				free(sub_prob.y);
-                                free(sub_prob.W);
+				free(sub_prob.W);
 				++p;
 			}
 
@@ -2714,24 +2810,23 @@ PREFIX(model) *PREFIX(train)(const PREFIX(problem) *prob, const svm_parameter *p
 			nz_count[i] = nSV;
 		}
 
-                info("Total nSV = %d\n",total_sv);
+		info("Total nSV = %d\n",total_sv);
 
 		model->l = total_sv;
-                model->sv_ind = Malloc(int, total_sv);
-#ifdef _DENSE_REP
-		model->SV = Malloc(PREFIX(node),total_sv);
+		model->sv_ind = Malloc(int, total_sv);
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+		model->PREFIX_D(SV) = Malloc(PREFIX_D(node),total_sv);
 #else
-		model->SV = Malloc(PREFIX(node) *,total_sv);
+		model->PREFIX_D(SV) = Malloc(PREFIX_D(node) *,total_sv);
 #endif
 		p = 0;
 		for(i=0;i<l;i++) {
 			if(nonzero[i]) { 
-                                model->SV[p] = x[i];
-                                model->sv_ind[p] = perm[i];
-                                ++p;
-                        }
-                }
-
+				model->PREFIX_D(SV)[p] = x[i];
+				model->sv_ind[p] = perm[i];
+				++p;
+			}
+		}
 		int *nz_start = Malloc(int,nr_class);
 		nz_start[0] = 0;
 		for(i=1;i<nr_class;i++)
@@ -2782,14 +2877,18 @@ PREFIX(model) *PREFIX(train)(const PREFIX(problem) *prob, const svm_parameter *p
 		free(nz_count);
 		free(nz_start);
 	}
-	free(newprob.x);
+	free(newprob.PREFIX_D(x));
 	free(newprob.y);
 	free(newprob.W);
 	return model;
 }
 
 // Stratified cross validation
-void PREFIX(cross_validation)(const PREFIX(problem) *prob, const svm_parameter *param, int nr_fold, double *target, BlasFunctions *blas_functions)
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+void PREFIX_D(cross_validation)(const PREFIX(problem) *prob, const svm_parameter *param, int nr_fold, double *target, BlasFunctions *blas_functions)
+#else
+void PREFIX_D(fp64_cross_validation)(const PREFIX(problem) *prob, const svm_parameter *param, int nr_fold, double *target, BlasFunctions *blas_functions)
+#endif
 {
 	int i;
 	int *fold_start = Malloc(int,nr_fold+1);
@@ -2872,10 +2971,10 @@ void PREFIX(cross_validation)(const PREFIX(problem) *prob, const svm_parameter *
 		struct PREFIX(problem) subprob;
 
 		subprob.l = l-(end-begin);
-#ifdef _DENSE_REP
-		subprob.x = Malloc(struct PREFIX(node),subprob.l);
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+		subprob.PREFIX_D(x) = Malloc(struct PREFIX_D(node),subprob.l);
 #else
-		subprob.x = Malloc(struct PREFIX(node)*,subprob.l);
+		subprob.PREFIX_D(x) = Malloc(struct PREFIX_D(node)*,subprob.l);
 #endif
 		subprob.y = Malloc(double,subprob.l);
 		subprob.W = Malloc(double,subprob.l);
@@ -2883,14 +2982,14 @@ void PREFIX(cross_validation)(const PREFIX(problem) *prob, const svm_parameter *
 		k=0;
 		for(j=0;j<begin;j++)
 		{
-			subprob.x[k] = prob->x[perm[j]];
+			subprob.PREFIX_D(x)[k] = prob->PREFIX_D(x)[perm[j]];
 			subprob.y[k] = prob->y[perm[j]];
 			subprob.W[k] = prob->W[perm[j]];
 			++k;
 		}
 		for(j=end;j<l;j++)
 		{
-			subprob.x[k] = prob->x[perm[j]];
+			subprob.PREFIX_D(x)[k] = prob->PREFIX_D(x)[perm[j]];
 			subprob.y[k] = prob->y[perm[j]];
 			subprob.W[k] = prob->W[perm[j]];
 			++k;
@@ -2902,60 +3001,68 @@ void PREFIX(cross_validation)(const PREFIX(problem) *prob, const svm_parameter *
 		{
 			double *prob_estimates=Malloc(double, PREFIX(get_nr_class)(submodel));
 			for(j=begin;j<end;j++)
-#ifdef _DENSE_REP
-				target[perm[j]] = PREFIX(predict_probability)(submodel,(prob->x + perm[j]),prob_estimates, blas_functions);
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+				target[perm[j]] = PREFIX_D(predict_probability)(submodel,(prob->PREFIX_D(x) + perm[j]),prob_estimates, blas_functions);
 #else
-                                target[perm[j]] = PREFIX(predict_probability)(submodel,prob->x[perm[j]],prob_estimates, blas_functions);
+				target[perm[j]] = PREFIX_D(predict_probability)(submodel,prob->PREFIX_D(x)[perm[j]],prob_estimates, blas_functions);
 #endif
 			free(prob_estimates);			
 		}
 		else
 			for(j=begin;j<end;j++)
-#ifdef _DENSE_REP
-				target[perm[j]] = PREFIX(predict)(submodel,prob->x+perm[j],blas_functions);
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+				target[perm[j]] = PREFIX_D(predict)(submodel,prob->PREFIX_D(x)+perm[j],blas_functions);
 #else
-                target[perm[j]] = PREFIX(predict)(submodel,prob->x[perm[j]],blas_functions);
+                target[perm[j]] = PREFIX_D(predict)(submodel,prob->PREFIX_D(x)[perm[j]],blas_functions);
 #endif
 		PREFIX(free_and_destroy_model)(&submodel);
-		free(subprob.x);
+		free(subprob.PREFIX_D(x));
 		free(subprob.y);
-                free(subprob.W);
+		free(subprob.W);
 	}		
 	free(fold_start);
 	free(perm);	
 }
 
-
-int PREFIX(get_svm_type)(const PREFIX(model) *model)
+double PREFIX_D(predict_probability)(const PREFIX(model) *model, const PREFIX_D(node) *x, double *prob_estimates, BlasFunctions *blas_functions)
 {
-	return model->param.svm_type;
-}
-
-int PREFIX(get_nr_class)(const PREFIX(model) *model)
-{
-	return model->nr_class;
-}
-
-void PREFIX(get_labels)(const PREFIX(model) *model, int* label)
-{
-	if (model->label != NULL)
-		for(int i=0;i<model->nr_class;i++)
-			label[i] = model->label[i];
-}
-
-double PREFIX(get_svr_probability)(const PREFIX(model) *model)
-{
-	if ((model->param.svm_type == EPSILON_SVR || model->param.svm_type == NU_SVR) &&
-	    model->probA!=NULL)
-		return model->probA[0];
-	else
+	if ((model->param.svm_type == C_SVC || model->param.svm_type == NU_SVC) &&
+	    model->probA!=NULL && model->probB!=NULL)
 	{
-		fprintf(stderr,"Model doesn't contain information for SVR probability inference\n");
-		return 0;
+		int i;
+		int nr_class = model->nr_class;
+		double *dec_values = Malloc(double, nr_class*(nr_class-1)/2);
+		PREFIX_D(predict_values)(model, x, dec_values, blas_functions);
+
+		double min_prob=1e-7;
+		double **pairwise_prob=Malloc(double *,nr_class);
+		for(i=0;i<nr_class;i++)
+			pairwise_prob[i]=Malloc(double,nr_class);
+		int k=0;
+		for(i=0;i<nr_class;i++)
+			for(int j=i+1;j<nr_class;j++)
+			{
+				pairwise_prob[i][j]=min(max(NAMESPACE::sigmoid_predict(dec_values[k],model->probA[k],model->probB[k]),min_prob),1-min_prob);
+				pairwise_prob[j][i]=1-pairwise_prob[i][j];
+				k++;
+			}
+		NAMESPACE::multiclass_probability(nr_class,pairwise_prob,prob_estimates);
+
+		int prob_max_idx = 0;
+		for(i=1;i<nr_class;i++)
+			if(prob_estimates[i] > prob_estimates[prob_max_idx])
+				prob_max_idx = i;
+		for(i=0;i<nr_class;i++)
+			free(pairwise_prob[i]);
+		free(dec_values);
+		free(pairwise_prob);
+		return model->label[prob_max_idx];
 	}
+	else
+		return PREFIX_D(predict)(model, x, blas_functions);
 }
 
-double PREFIX(predict_values)(const PREFIX(model) *model, const PREFIX(node) *x, double* dec_values, BlasFunctions *blas_functions)
+double PREFIX_D(predict_values)(const PREFIX(model) *model, const PREFIX_D(node) *x, double* dec_values, BlasFunctions *blas_functions)
 {
 	int i;
 	if(model->param.svm_type == ONE_CLASS ||
@@ -2965,12 +3072,13 @@ double PREFIX(predict_values)(const PREFIX(model) *model, const PREFIX(node) *x,
 		double *sv_coef = model->sv_coef[0];
 		double sum = 0;
 		
-		for(i=0;i<model->l;i++)
-#ifdef _DENSE_REP
-                    sum += sv_coef[i] * NAMESPACE::Kernel::k_function(x,model->SV+i,model->param,blas_functions);
+		for(i=0;i<model->l;i++) {
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+			sum += sv_coef[i] * NAMESPACE::Kernel::k_function(x,model->PREFIX_D(SV)+i,model->param,blas_functions);
 #else
-                sum += sv_coef[i] * NAMESPACE::Kernel::k_function(x,model->SV[i],model->param,blas_functions);
+			sum += sv_coef[i] * NAMESPACE::Kernel::k_function(x,model->PREFIX_D(SV)[i],model->param,blas_functions);
 #endif
+		}
 		sum -= model->rho[0];
 		*dec_values = sum;
 
@@ -2978,30 +3086,31 @@ double PREFIX(predict_values)(const PREFIX(model) *model, const PREFIX(node) *x,
 			return (sum>0)?1:-1;
 		else
 			return sum;
-	}
-	else
-	{
+    } else {
 		int nr_class = model->nr_class;
 		int l = model->l;
 		
+#if defined(_DENSE_FP64) || defined(_DENSE_BF16)
+#ifdef _DENSE_FP64
 		double *kvalue = Malloc(double,l);
-#ifdef _DENSE_REP
+#else
+		float *kvalue = Malloc(float,l);
+#endif
         int kernel_type = model->param.kernel_type;
         if(kernel_type != RBF) {
-#endif
 		    for(i=0; i<l; i++) {
-#ifdef _DENSE_REP
-                kvalue[i] = NAMESPACE::Kernel::k_function(x,model->SV+i,model->param,blas_functions);
-#else
-                kvalue[i] = NAMESPACE::Kernel::k_function(x,model->SV[i],model->param,blas_functions);
-#endif
+				kvalue[i] = NAMESPACE::Kernel::k_function(x,model->PREFIX_D(SV)+i,model->param,blas_functions);
 			}
-#ifdef _DENSE_REP
 		} else {
             for(int i=0; i<l; i++) {
                 kvalue[i] = model->sv_square[i];
             }
-            NAMESPACE::Kernel::k_gemv_function(l, model->param.gamma, x, model->SV[0].values, kvalue, blas_functions);
+			NAMESPACE::Kernel::k_gemv_function(l, model->param.gamma, x, model->PREFIX_D(SV)[0].values, kvalue, blas_functions);
+		}
+#else
+		double *kvalue = Malloc(double,l);
+		for(i=0; i<l; i++) {
+			kvalue[i] = NAMESPACE::Kernel::k_function(x,model->PREFIX_D(SV)[i],model->param,blas_functions);
 		}
 #endif
 
@@ -3053,100 +3162,111 @@ double PREFIX(predict_values)(const PREFIX(model) *model, const PREFIX(node) *x,
 	}
 }
 
-double PREFIX(predict)(const PREFIX(model) *model, const PREFIX(node) *x, BlasFunctions *blas_functions)
+double PREFIX_D(predict)(const PREFIX(model) *model, const PREFIX_D(node) *x, BlasFunctions *blas_functions)
 {
 	int nr_class = model->nr_class;
 	double *dec_values;
-	if(model->param.svm_type == ONE_CLASS ||
-	   model->param.svm_type == EPSILON_SVR ||
-	   model->param.svm_type == NU_SVR)
+	if(model->param.svm_type == ONE_CLASS || model->param.svm_type == EPSILON_SVR || model->param.svm_type == NU_SVR) {
 		dec_values = Malloc(double, 1);
-	else 
+	} else {
 		dec_values = Malloc(double, nr_class*(nr_class-1)/2);
-	double pred_result = PREFIX(predict_values)(model, x, dec_values, blas_functions);
+	}
+
+	double pred_result;
+	pred_result = PREFIX_D(predict_values)(model, x, dec_values, blas_functions);
+
 	free(dec_values);
+
 	return pred_result;
 }
 
-double PREFIX(predict_probability)(
-	const PREFIX(model) *model, const PREFIX(node) *x, double *prob_estimates, BlasFunctions *blas_functions)
+
+/* ---- Section for Functions not supported or not specific by BF16 ---- */
+#ifndef _DENSE_BF16
+
+int PREFIX(get_svm_type)(const PREFIX(model) *model)
 {
-	if ((model->param.svm_type == C_SVC || model->param.svm_type == NU_SVC) &&
-	    model->probA!=NULL && model->probB!=NULL)
-	{
-		int i;
-		int nr_class = model->nr_class;
-		double *dec_values = Malloc(double, nr_class*(nr_class-1)/2);
-		PREFIX(predict_values)(model, x, dec_values, blas_functions);
-
-		double min_prob=1e-7;
-		double **pairwise_prob=Malloc(double *,nr_class);
-		for(i=0;i<nr_class;i++)
-			pairwise_prob[i]=Malloc(double,nr_class);
-		int k=0;
-		for(i=0;i<nr_class;i++)
-			for(int j=i+1;j<nr_class;j++)
-			{
-                            pairwise_prob[i][j]=min(max(NAMESPACE::sigmoid_predict(dec_values[k],model->probA[k],model->probB[k]),min_prob),1-min_prob);
-				pairwise_prob[j][i]=1-pairwise_prob[i][j];
-				k++;
-			}
-                NAMESPACE::multiclass_probability(nr_class,pairwise_prob,prob_estimates);
-
-		int prob_max_idx = 0;
-		for(i=1;i<nr_class;i++)
-			if(prob_estimates[i] > prob_estimates[prob_max_idx])
-				prob_max_idx = i;
-		for(i=0;i<nr_class;i++)
-			free(pairwise_prob[i]);
-		free(dec_values);
-		free(pairwise_prob);	     
-		return model->label[prob_max_idx];
-	}
-	else 
-		return PREFIX(predict)(model, x, blas_functions);
+	return model->param.svm_type;
 }
 
+int PREFIX(get_nr_class)(const PREFIX(model) *model)
+{
+	return model->nr_class;
+}
+
+void PREFIX(get_labels)(const PREFIX(model) *model, int* label)
+{
+	if (model->label != NULL)
+		for(int i=0;i<model->nr_class;i++)
+			label[i] = model->label[i];
+}
+
+double PREFIX(get_svr_probability)(const PREFIX(model) *model)
+{
+	if ((model->param.svm_type == EPSILON_SVR || model->param.svm_type == NU_SVR) &&
+	    model->probA!=NULL)
+		return model->probA[0];
+	else
+	{
+		fprintf(stderr,"Model doesn't contain information for SVR probability inference\n");
+		return 0;
+	}
+}
 
 void PREFIX(free_model_content)(PREFIX(model)* model_ptr)
 {
-	if(model_ptr->free_sv && model_ptr->l > 0 && model_ptr->SV != NULL)
-#ifdef _DENSE_REP
-		for (int i = 0; i < model_ptr->l; i++)
-			free(model_ptr->SV[i].values);
+    if(model_ptr->free_sv && model_ptr->l > 0) {
+#ifdef _DENSE_FP64
+        if (model_ptr->data_mode == DATA_MODE_FP64) {
+            if (model_ptr->svm_fp64_SV != NULL) {
+                for (int i = 0; i < model_ptr->l; i++) {
+                    free(model_ptr->svm_fp64_SV[i].values);
+                }
+            }
+            free(model_ptr->svm_fp64_SV);
+            model_ptr->svm_fp64_SV = NULL;
+        } else {
+            if (model_ptr->svm_bf16_SV != NULL) {
+                for (int i = 0; i < model_ptr->l; i++) {
+                    free(model_ptr->svm_bf16_SV[i].values);
+                }
+            }
+            free(model_ptr->svm_bf16_SV);
+            model_ptr->svm_bf16_SV = NULL;
+        }
 #else
-		free((void *)(model_ptr->SV[0]));
+        free((void *)(model_ptr->svm_csr_SV[0]));
+        free(model_ptr->svm_csr_SV);
+        model_ptr->svm_csr_SV = NULL;
 #endif
+    }
 
-	if(model_ptr->sv_coef)
-	{
-		for(int i=0;i<model_ptr->nr_class-1;i++)
-			free(model_ptr->sv_coef[i]);
-	}
+    if(model_ptr->sv_coef)
+    {
+        for(int i=0;i<model_ptr->nr_class-1;i++)
+            free(model_ptr->sv_coef[i]);
+    }
 
-	free(model_ptr->SV);
-	model_ptr->SV = NULL;
+    free(model_ptr->sv_coef);
+    model_ptr->sv_coef = NULL;
 
-	free(model_ptr->sv_coef);
-	model_ptr->sv_coef = NULL;
+    free(model_ptr->sv_ind);
+    model_ptr->sv_ind = NULL;
 
-	free(model_ptr->sv_ind);
-	model_ptr->sv_ind = NULL;
+    free(model_ptr->rho);
+    model_ptr->rho = NULL;
 
-	free(model_ptr->rho);
-	model_ptr->rho = NULL;
+    free(model_ptr->label);
+    model_ptr->label= NULL;
 
-	free(model_ptr->label);
-	model_ptr->label= NULL;
+    free(model_ptr->probA);
+    model_ptr->probA = NULL;
 
-	free(model_ptr->probA);
-	model_ptr->probA = NULL;
+    free(model_ptr->probB);
+    model_ptr->probB= NULL;
 
-	free(model_ptr->probB);
-	model_ptr->probB= NULL;
-
-	free(model_ptr->nSV);
-	model_ptr->nSV = NULL;
+    free(model_ptr->nSV);
+    model_ptr->nSV = NULL;
 }
 
 void PREFIX(free_and_destroy_model)(PREFIX(model)** model_ptr_ptr)
@@ -3291,8 +3411,15 @@ const char *PREFIX(check_parameter)(const PREFIX(problem) *prob, const svm_param
 	{
 		PREFIX(problem) newprob;
 		// filter samples with negative and null weights 
-		remove_zero_weight(&newprob, prob, false);
-
+#ifdef _DENSE_FP64
+		if (prob->data_mode == DATA_MODE_FP64) {
+			svm_fp64_remove_zero_weight(&newprob, prob, false);
+		} else {
+			svm_bf16_remove_zero_weight(&newprob, prob, false);
+		}
+#else
+		svm_csr_remove_zero_weight(&newprob, prob, false);
+#endif
 		char* msg = NULL;
 		// all samples were removed
 		if(newprob.l == 0)
@@ -3314,7 +3441,15 @@ const char *PREFIX(check_parameter)(const PREFIX(problem) *prob, const svm_param
 				msg = "Invalid input - all samples with positive weights have the same label.";
 		}
 
-		free(newprob.x);
+#ifdef _DENSE_FP64
+		if (newprob.data_mode == DATA_MODE_FP64) {
+			free(newprob.svm_fp64_x);
+		} else {
+			free(newprob.svm_bf16_x);
+		}
+#else
+		free(newprob.svm_csr_x);
+#endif
 		free(newprob.y);
 		free(newprob.W);
 		if(msg != NULL)
@@ -3330,3 +3465,39 @@ void PREFIX(set_print_string_function)(void (*print_func)(const char *))
 	else
 		svm_print_string = print_func;
 }
+
+void PREFIX(cross_validation)(const PREFIX(problem) *prob, const svm_parameter *param, int nr_fold, double *target, BlasFunctions *blas_functions)
+{
+#ifdef _DENSE_FP64
+	if(prob->data_mode == DATA_MODE_FP64) {
+		return svm_fp64_cross_validation(prob, param, nr_fold, target, blas_functions);
+	} else {
+		return svm_bf16_cross_validation(prob, param, nr_fold, target, blas_functions);
+	}
+#else
+	return svm_csr_fp64_cross_validation(prob, param, nr_fold, target, blas_functions);
+#endif
+}
+
+#ifdef _DENSE_FP64
+PREFIX(model) *PREFIX(train)(      PREFIX(problem) *prob, const svm_parameter *param, int *status, BlasFunctions *blas_functions)
+{
+	if(param->svm_type == ONE_CLASS || param->svm_type == EPSILON_SVR || param->svm_type == NU_SVR) {
+		return svm_fp64_train(prob, param, status, blas_functions);    //SVR and one class is the same as fp64, bf16 not supported
+	} else{
+		if(prob->data_mode == DATA_MODE_FP64) {
+			return svm_fp64_train(prob, param, status, blas_functions);
+		} else {
+			return svm_bf16_train(prob, param, status, blas_functions);
+		}
+	}
+}
+#else
+PREFIX(model) *PREFIX(train)(const PREFIX(problem) *prob, const svm_parameter *param, int *status, BlasFunctions *blas_functions)
+{
+	return svm_csr_fp64_train(prob, param, status, blas_functions);
+}
+#endif
+
+#endif
+// ---- End of Section for Functions not supported or not specific by BF16 ---- //

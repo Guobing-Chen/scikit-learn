@@ -358,12 +358,20 @@ class BaseLibSVM(BaseEstimator, metaclass=ABCMeta):
 
         svm_type = LIBSVM_IMPL.index(self._impl)
 
-        return libsvm.predict(
-            X, self.support_, self.support_vectors_, self._n_support,
-            self._dual_coef_, self._intercept_,
-            self._probA, self._probB, svm_type=svm_type, kernel=kernel,
-            degree=self.degree, coef0=self.coef0, gamma=self._gamma,
-            cache_size=self.cache_size)
+        if self.support_vectors_.dtype.type == np.float64:
+            return libsvm.predict(
+                X, self.support_, self.support_vectors_, self._n_support,
+                self._dual_coef_, self._intercept_,
+                self._probA, self._probB, svm_type=svm_type, kernel=kernel,
+                degree=self.degree, coef0=self.coef0, gamma=self._gamma,
+                cache_size=self.cache_size)
+        else:
+             return libsvm.predict_bf16(
+                X, self.support_, self.support_vectors_, self._n_support,
+                self._dual_coef_, self._intercept_,
+                self._probA, self._probB, svm_type=svm_type, kernel=kernel,
+                degree=self.degree, coef0=self.coef0, gamma=self._gamma,
+                cache_size=self.cache_size)
 
     def _sparse_predict(self, X):
         # Precondition: X is a csr_matrix of dtype np.float64.

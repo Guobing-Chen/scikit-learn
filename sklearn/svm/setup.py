@@ -43,6 +43,10 @@ def configuration(parent_package='', top_path=None):
                       join('src', 'libsvm', 'svm.h'),
                       join('src', 'newrand', 'newrand.h')]
 
+    blas_compile_args = ['-lopenblas']
+    blas_link_args = ['-lopenblas']
+    compile_args = list(blas_compile_args)
+    link_args = list(blas_link_args)
     config.add_extension('_libsvm',
                          sources=libsvm_sources,
                          include_dirs=[numpy.get_include(),
@@ -50,6 +54,8 @@ def configuration(parent_package='', top_path=None):
                                        join('src', 'newrand')],
                          libraries=['libsvm-skl'],
                          depends=libsvm_depends,
+                         extra_compile_args=compile_args,
+                         extra_link_args=link_args,
                          )
 
     # liblinear module
@@ -91,6 +97,10 @@ def configuration(parent_package='', top_path=None):
 
     # this should go *after* libsvm-skl
     libsvm_sparse_sources = ['_libsvm_sparse.pyx']
+    blas_compile_args = ['-lopenblas']
+    blas_link_args = ['-lopenblas']
+    compile_args = list(blas_compile_args)
+    link_args = list(blas_link_args)
     config.add_extension('_libsvm_sparse', libraries=['libsvm-skl'],
                          sources=libsvm_sparse_sources,
                          include_dirs=[numpy.get_include(),
@@ -99,7 +109,10 @@ def configuration(parent_package='', top_path=None):
                          depends=[join("src", "libsvm", "svm.h"),
                                   join('src', 'newrand', 'newrand.h'),
                                   join("src", "libsvm",
-                                       "libsvm_sparse_helper.c")])
+                                       "libsvm_sparse_helper.c")],
+                         extra_compile_args=compile_args,
+                         extra_link_args=link_args,
+                                       )
 
     return config
 

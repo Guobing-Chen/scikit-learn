@@ -85,12 +85,12 @@ struct svm_csr_problem * csr_set_problem (char *values, npy_intp *n_indices,
     if (problem == NULL) return NULL;
     problem->l = (int) n_indptr[0] - 1;
     problem->y = (double *) Y;
-    problem->x = csr_to_libsvm((double *) values, (int *) indices,
+    problem->svm_csr_x = csr_to_libsvm((double *) values, (int *) indices,
                                (int *) indptr, problem->l);
     /* should be removed once we implement weighted samples */
     problem->W = (double *) sample_weight;
 
-    if (problem->x == NULL) {
+    if (problem->svm_csr_x == NULL) {
         free(problem);
         return NULL;
     }
@@ -126,7 +126,7 @@ struct svm_csr_model *csr_set_model(struct svm_parameter *param, int nr_class,
        dense_to_precomputed because we don't want the leading 0. As
        indices start at 1 (not at 0) this will work */
     model->l = (int) SV_indptr_dims[0] - 1;
-    model->SV = csr_to_libsvm((double *) SV_data, (int *) SV_indices,
+    model->svm_csr_SV = csr_to_libsvm((double *) SV_data, (int *) SV_indices,
                               (int *) SV_intptr, model->l);
     model->nr_class = nr_class;
     model->param = *param;
@@ -213,11 +213,11 @@ int csr_copy_SV (char *data, npy_intp *n_indices,
 	int *iindptr  = (int *) indptr;
 	iindptr[0] = 0;
 	for (i=0; i<model->l; ++i) { /* iterate over support vectors */
-		index = model->SV[i][0].index;
+		index = model->svm_csr_SV[i][0].index;
         for(j=0; index >=0 ; ++j) {
         	iindices[k] = index - 1;
-            dvalues[k] = model->SV[i][j].value;
-            index = model->SV[i][j+1].index;
+            dvalues[k] = model->svm_csr_SV[i][j].value;
+            index = model->svm_csr_SV[i][j+1].index;
             ++k;
         }
         iindptr[i+1] = k;
@@ -232,7 +232,7 @@ npy_intp get_nonzero_SV (struct svm_csr_model *model) {
 	npy_intp count=0;
 	for (i=0; i<model->l; ++i) {
 		j = 0;
-		while (model->SV[i][j].index != -1) {
+		while (model->svm_csr_SV[i][j].index != -1) {
 			++j;
 			++count;
 		}
@@ -393,8 +393,8 @@ int free_problem(struct svm_csr_problem *problem)
     int i;
     if (problem == NULL) return -1;
     for (i=0; i<problem->l; ++i)
-        free (problem->x[i]);
-    free (problem->x);
+        free (problem->svm_csr_x[i]);
+    free (problem->svm_csr_x);
     free (problem);
     return 0;
 }
@@ -403,7 +403,7 @@ int free_model(struct svm_csr_model *model)
 {
     /* like svm_free_and_destroy_model, but does not free sv_coef[i] */
     if (model == NULL) return -1;
-    free(model->SV);
+    free(model->svm_csr_SV);
     free(model->sv_coef);
     free(model->rho);
     free(model->label);
@@ -426,8 +426,8 @@ int free_param(struct svm_parameter *param)
 int free_model_SV(struct svm_csr_model *model)
 {
     int i;
-    for (i=model->l-1; i>=0; --i) free(model->SV[i]);
-    /* svn_destroy_model frees model->SV */
+    for (i=model->l-1; i>=0; --i) free(model->svm_csr_SV[i]);
+    /* svn_destroy_model frees model->svm_csr_SV */
     for (i=0; i < model->nr_class-1 ; ++i) free(model->sv_coef[i]);
     /* svn_destroy_model frees model->sv_coef */
     return 0;

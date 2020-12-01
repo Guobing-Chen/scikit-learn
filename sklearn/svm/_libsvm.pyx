@@ -180,7 +180,7 @@ def fit(
     kernel_index = LIBSVM_KERNEL_TYPES.index(kernel)
     set_problem(
         &problem, X.data, Y.data, sample_weight.data, X.shape, kernel_index)
-    if problem.x == NULL:
+    if problem.svm_fp64_x == NULL and problem.svm_bf16_x == NULL:
         raise MemoryError("Seems we've run out of memory")
     cdef np.ndarray[np.int32_t, ndim=1, mode='c'] \
         class_weight_label = np.arange(class_weight.shape[0], dtype=np.int32)
@@ -223,13 +223,22 @@ def fit(
     copy_support (support.data, model)
 
     # copy model.SV
-    cdef np.ndarray[np.float64_t, ndim=2, mode='c'] support_vectors
-    if kernel_index == 4:
-        # precomputed kernel
-        support_vectors = np.empty((0, 0), dtype=np.float64)
-    else:
-        support_vectors = np.empty((SV_len, X.shape[1]), dtype=np.float64)
-        copy_SV(support_vectors.data, model, support_vectors.shape)
+    cdef np.ndarray[np.float64_t, ndim=2, mode='c'] fp64_support_vectors
+    cdef np.ndarray[np.uint16_t, ndim=2, mode='c'] bf16_support_vectors
+    if problem.data_mode == 0:   # DATA_MODE_FP64
+        if kernel_index == 4:
+            # precomputed kernel
+            fp64_support_vectors = np.empty((0, 0), dtype=np.float64)
+        else:
+            fp64_support_vectors = np.empty((SV_len, X.shape[1]), dtype=np.float64)
+            copy_SV(fp64_support_vectors.data, model, fp64_support_vectors.shape)
+    else:                        # DATA_MODE_BF16
+        if kernel_index == 4:
+            # precomputed kernel
+            bf16_support_vectors = np.empty((0, 0), dtype=np.uint16)
+        else:
+            bf16_support_vectors = np.empty((SV_len, X.shape[1]), dtype=np.uint16)
+            copy_SV(bf16_support_vectors.data, model, bf16_support_vectors.shape)
 
     cdef np.ndarray[np.int32_t, ndim=1, mode='c'] n_class_SV
     if svm_type == 0 or svm_type == 1:
@@ -255,10 +264,15 @@ def fit(
         probB = np.empty(0, dtype=np.float64)
 
     svm_free_and_destroy_model(&model)
-    free(problem.x)
+    if problem.svm_fp64_x != NULL:
+        free(problem.svm_fp64_x)
+    if problem.svm_bf16_x != NULL:
+        free(problem.svm_bf16_x)
 
-    return (support, support_vectors, n_class_SV, sv_coef, intercept,
-           probA, probB, fit_status)
+    if problem.data_mode == 0:  # DATA_MODE_FP64
+        return (support, fp64_support_vectors, n_class_SV, sv_coef, intercept, probA, probB, fit_status)
+    else:
+        return (support, bf16_support_vectors, n_class_SV, sv_coef, intercept, probA, probB, fit_status)
 
 
 cdef void set_predict_params(
@@ -381,6 +395,103 @@ def predict(np.ndarray[np.float64_t, ndim=2, mode='c'] X,
 
     return dec_values
 
+def predict_bf16(np.ndarray[np.float64_t, ndim=2, mode='c'] X,
+            np.ndarray[np.int32_t, ndim=1, mode='c'] support,
+            np.ndarray[np.uint16_t, ndim=2, mode='c'] SV,
+            np.ndarray[np.int32_t, ndim=1, mode='c'] nSV,
+            np.ndarray[np.float64_t, ndim=2, mode='c'] sv_coef,
+            np.ndarray[np.float64_t, ndim=1, mode='c'] intercept,
+            np.ndarray[np.float64_t, ndim=1, mode='c'] probA=np.empty(0),
+            np.ndarray[np.float64_t, ndim=1, mode='c'] probB=np.empty(0),
+            int svm_type=0, kernel='rbf', int degree=3,
+            double gamma=0.1, double coef0=0.,
+            np.ndarray[np.float64_t, ndim=1, mode='c']
+                class_weight=np.empty(0),
+            np.ndarray[np.float64_t, ndim=1, mode='c']
+                sample_weight=np.empty(0),
+            double cache_size=100.):
+    """
+    Predict target values of X given a model (low-level method)
+
+    Parameters
+    ----------
+    X : array-like, dtype=float of shape (n_samples, n_features)
+
+    support : array of shape (n_support,)
+        Index of support vectors in training set.
+
+    SV : array of shape (n_support, n_features)
+        Support vectors.
+
+    nSV : array of shape (n_class,)
+        Number of support vectors in each class.
+
+    sv_coef : array of shape (n_class-1, n_support)
+        Coefficients of support vectors in decision function.
+
+    intercept : array of shape (n_class*(n_class-1)/2)
+        Intercept in decision function.
+
+    probA, probB : array of shape (n_class*(n_class-1)/2,)
+        Probability estimates.
+
+    svm_type : {0, 1, 2, 3, 4}, default=0
+        Type of SVM: C_SVC, NuSVC, OneClassSVM, EpsilonSVR or NuSVR
+        respectively.
+
+    kernel : {'linear', 'rbf', 'poly', 'sigmoid', 'precomputed'}, default="rbf"
+        Kernel to use in the model: linear, polynomial, RBF, sigmoid
+        or precomputed.
+
+    degree : int32, default=3
+        Degree of the polynomial kernel (only relevant if kernel is
+        set to polynomial).
+
+    gamma : float64, default=0.1
+        Gamma parameter in rbf, poly and sigmoid kernels. Ignored by other
+        kernels.
+
+    coef0 : float64, default=0.0
+        Independent parameter in poly/sigmoid kernel.
+
+    Returns
+    -------
+    dec_values : array
+        Predicted values.
+    """
+    cdef np.ndarray[np.float64_t, ndim=1, mode='c'] dec_values
+    cdef svm_parameter param
+    cdef svm_model *model
+    cdef int rv
+
+    cdef np.ndarray[np.int32_t, ndim=1, mode='c'] \
+        class_weight_label = np.arange(class_weight.shape[0], dtype=np.int32)
+
+    set_predict_params(&param, svm_type, kernel, degree, gamma, coef0,
+                       cache_size, 0, <int>class_weight.shape[0],
+                       class_weight_label.data, class_weight.data)
+
+    cdef BlasFunctions blas_functions
+    blas_functions.dot = _dot[double]
+    blas_functions.dscal = _scal[double]
+    blas_functions.dgemv = _gemv[double]
+
+    model = set_model(&param, <int> nSV.shape[0], SV.data, SV.shape,
+                      support.data, support.shape, sv_coef.strides,
+                      sv_coef.data, intercept.data, nSV.data, probA.data, probB.data,
+                      &blas_functions)
+
+    #TODO: use check_model
+    try:
+        dec_values = np.empty(X.shape[0])
+        with nogil:
+            rv = copy_predict(X.data, model, X.shape, dec_values.data, &blas_functions)
+        if rv < 0:
+            raise MemoryError("We've run out of memory")
+    finally:
+        free_model(model)
+
+    return dec_values
 
 def predict_proba(
     np.ndarray[np.float64_t, ndim=2, mode='c'] X,
@@ -717,7 +828,7 @@ def cross_validation(
     kernel_index = LIBSVM_KERNEL_TYPES.index(kernel)
     set_problem(
         &problem, X.data, Y.data, sample_weight.data, X.shape, kernel_index)
-    if problem.x == NULL:
+    if problem.svm_fp64_x == NULL and problem.svm_bf16_x == NULL:
         raise MemoryError("Seems we've run out of memory")
     cdef np.ndarray[np.int32_t, ndim=1, mode='c'] \
         class_weight_label = np.arange(class_weight.shape[0], dtype=np.int32)
@@ -743,7 +854,10 @@ def cross_validation(
         with nogil:
             svm_cross_validation(&problem, &param, n_fold, <double *> target.data, &blas_functions)
     finally:
-        free(problem.x)
+        if problem.svm_fp64_x != NULL:
+            free(problem.svm_fp64_x)
+        if problem.svm_bf16_x != NULL:
+            free(problem.svm_bf16_x)
 
     return target
 

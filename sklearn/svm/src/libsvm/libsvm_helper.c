@@ -30,14 +30,14 @@
  * contiguous, but in practice its a reasonable assumption.
  *
  */
-struct svm_node *dense_to_libsvm (double *x, npy_intp *dims)
+struct svm_fp64_node * dense_to_fp64_libsvm(double *x, npy_intp *dims)
 {
-    struct svm_node *node;
+    struct svm_fp64_node *node;
     npy_intp len_row = dims[1];
     double *tx = x;
     int i;
 
-    node = malloc (dims[0] * sizeof(struct svm_node));
+    node = malloc (dims[0] * sizeof(struct svm_fp64_node));
 
     if (node == NULL) return NULL;
     for (i=0; i<dims[0]; ++i) {
@@ -51,13 +51,69 @@ struct svm_node *dense_to_libsvm (double *x, npy_intp *dims)
     return node;
 }
 
-double* set_sv_square(struct svm_node* SV, int l, BlasFunctions *blas_functions)
+struct svm_bf16_node * dense_to_bf16_libsvm(double *x, npy_intp *dims)
+{
+    struct svm_bf16_node *node;
+    npy_intp len_row = dims[1];
+
+    bfloat16* bf16_x = (bfloat16*)malloc(dims[0]*dims[1] *sizeof(bfloat16));
+    cblas_sbdtobf16(dims[0]*dims[1], x, 1, bf16_x, 1);
+
+    node = malloc (dims[0] * sizeof(struct svm_bf16_node));
+
+    if (node == NULL) return NULL;
+
+    for (int i=0; i<dims[0]; ++i) {
+        node[i].values = bf16_x;
+        node[i].dim = (int) len_row;
+        node[i].ind = i; /* only used if kernel=precomputed, but not
+                            too much overhead */
+        bf16_x += len_row;
+    }
+
+    return node;
+}
+
+struct svm_bf16_node * bf16_dense_to_bf16_libsvm(bfloat16 *x, npy_intp *dims)
+{
+    struct svm_bf16_node *node;
+    npy_intp len_row = dims[1];
+
+    bfloat16* bf16_x = x;
+
+    node = malloc (dims[0] * sizeof(struct svm_bf16_node));
+
+    if (node == NULL) return NULL;
+
+    for (int i=0; i<dims[0]; ++i) {
+        node[i].values = bf16_x;
+        node[i].dim = (int) len_row;
+        node[i].ind = i; /* only used if kernel=precomputed, but not
+                            too much overhead */
+        bf16_x += len_row;
+    }
+
+    return node;
+}
+
+double* set_fp64_sv_square(struct svm_fp64_node* SV, int l, BlasFunctions *blas_functions)
 {
 	double * result = (double*) malloc(l * sizeof(double));
 	int dim = SV[0].dim;
 
 	for(int i=0; i<l; i++){
 		result[i] = blas_functions->dot(dim, SV[i].values, 1, SV[i].values, 1);
+	}
+	return result;
+}
+
+double* set_bf16_sv_square(struct svm_bf16_node* SV, int l)
+{
+	double * result = (float*) malloc(l * sizeof(double));
+	int dim = SV[0].dim;
+
+	for(int i=0; i<l; i++){
+		result[i] = (double) cblas_sbdot(dim, SV[i].values, 1, SV[i].values, 1);
 	}
 	return result;
 }
@@ -97,8 +153,20 @@ void set_problem(struct svm_problem *problem, char *X, char *Y, char *sample_wei
     if (problem == NULL) return;
     problem->l = (int) dims[0]; /* number of samples */
     problem->y = (double *) Y;
-    problem->x = dense_to_libsvm((double *) X, dims); /* implicit call to malloc */
     problem->W = (double *) sample_weight;
+
+    int data_mode = get_sklearn_data_mode();
+    problem->data_mode = data_mode;
+    if (data_mode == DATA_MODE_FP64) {
+        problem->svm_fp64_x = dense_to_fp64_libsvm((double *) X, dims); /* implicit call to malloc */
+        problem->svm_bf16_x = NULL;
+    } else if (data_mode == DATA_MODE_BF16) {
+        problem->svm_fp64_x = NULL;
+        problem->svm_bf16_x = dense_to_bf16_libsvm((double *) X, dims); /* implicit call to malloc */
+    } else {  // Fall back to FP64 when mode unknown
+        problem->svm_fp64_x = dense_to_fp64_libsvm((double *) X, dims); /* implicit call to malloc */
+        problem->svm_bf16_x = NULL;
+    }
 }
 
 /*
@@ -142,20 +210,35 @@ struct svm_model *set_model(struct svm_parameter *param, int nr_class,
     model->param = *param;
     model->l = (int) support_dims[0];
 
+    model->data_mode = get_sklearn_data_mode();
+
     if (param->kernel_type == PRECOMPUTED) {
-        if ((model->SV = malloc ((model->l) * sizeof(struct svm_node))) == NULL)
+        if ((model->svm_fp64_SV = malloc ((model->l) * sizeof(struct svm_fp64_node))) == NULL)
             goto SV_error;
         for (i=0; i<model->l; ++i) {
-            model->SV[i].ind = ((int *) support)[i];
-            model->SV[i].values = NULL;
+            model->svm_fp64_SV[i].ind = ((int *) support)[i];
+            model->svm_fp64_SV[i].values = NULL;
+        }
+        model->svm_bf16_SV = NULL;
+    } else if(param->kernel_type == RBF) {
+        if (model->data_mode == DATA_MODE_FP64) {
+            model->svm_fp64_SV = dense_to_fp64_libsvm((double *) SV, SV_dims);
+            model->sv_square = set_fp64_sv_square(model->svm_fp64_SV, SV_dims[0], blas_functions);
+            model->svm_bf16_SV = NULL;
+        } else if (model->data_mode == DATA_MODE_BF16) {
+            // Assume the SV passed from training to predict is bfloat16 based
+            model->svm_bf16_SV = bf16_dense_to_bf16_libsvm((bfloat16 *) SV, SV_dims);
+            model->sv_square = set_bf16_sv_square(model->svm_bf16_SV, SV_dims[0]);
+            model->svm_fp64_SV = NULL;
+        } else {  // Fall back to FP64 when mode unknown
+            model->svm_fp64_SV = dense_to_fp64_libsvm((double *) SV, SV_dims);
+            model->sv_square = set_fp64_sv_square(model->svm_fp64_SV, SV_dims[0], blas_functions);
+            model->svm_bf16_SV = NULL;
         }
     } else {
-        model->SV = dense_to_libsvm((double *) SV, SV_dims);
-        if(param->kernel_type == RBF) {
-            model->sv_square = set_sv_square(model->SV, SV_dims[0], blas_functions);
-        } else {
-            model->sv_square = NULL;
-        }
+        model->svm_fp64_SV = dense_to_fp64_libsvm((double *) SV, SV_dims);
+        model->sv_square = NULL;
+        model->svm_bf16_SV = NULL;
     }
     /*
      * regression and one-class does not use nSV, label.
@@ -199,7 +282,11 @@ struct svm_model *set_model(struct svm_parameter *param, int nr_class,
 probB_error:
     free(model->probA);
 probA_error:
-    free(model->SV);
+    if (model->data_mode == DATA_MODE_FP64) {
+        free(model->svm_fp64_SV);
+    } else {
+        free(model->svm_bf16_SV);
+    }
 SV_error:
     free(model->rho);
 rho_error:
@@ -269,11 +356,22 @@ void copy_intercept(char *data, struct svm_model *model, npy_intp *dims)
 void copy_SV(char *data, struct svm_model *model, npy_intp *dims)
 {
     int i, n = model->l;
-    double *tdata = (double *) data;
-    int dim = model->SV[0].dim;
-    for (i=0; i<n; ++i) {
-        memcpy (tdata, model->SV[i].values, dim * sizeof(double));
-        tdata += dim;
+
+    int dim;
+    if (model->data_mode == DATA_MODE_FP64) {
+        double *tdata = (double *) data;
+        dim = model->svm_fp64_SV[0].dim;
+        for (i=0; i<n; ++i) {
+            memcpy (tdata, model->svm_fp64_SV[i].values, dim * sizeof(double));
+            tdata += dim;
+        }
+    } else {
+        bfloat16 *tdata = (bfloat16 *) data;
+        dim = model->svm_bf16_SV[0].dim;
+        for (i=0; i<n; ++i) {
+            memcpy (tdata, model->svm_bf16_SV[i].values, dim * sizeof(bfloat16));
+            tdata += dim;
+        }
     }
 }
 
@@ -311,36 +409,60 @@ int copy_predict(char *predict, struct svm_model *model, npy_intp *predict_dims,
                  char *dec_values, BlasFunctions *blas_functions)
 {
     double *t = (double *) dec_values;
-    struct svm_node *predict_nodes;
-    npy_intp i;
+    if (model->data_mode == DATA_MODE_FP64) {
+        struct svm_fp64_node *predict_nodes;
+        predict_nodes = dense_to_fp64_libsvm((double *) predict, predict_dims);
 
-    predict_nodes = dense_to_libsvm((double *) predict, predict_dims);
+        if (predict_nodes == NULL)
+            return -1;
+        for(npy_intp i=0; i<predict_dims[0]; ++i) {
+            *t = svm_fp64_predict(model, &predict_nodes[i], blas_functions);
+            ++t;
+        }
+        free(predict_nodes);
+    } else {
+        struct svm_bf16_node *predict_nodes;
+        predict_nodes = dense_to_bf16_libsvm((double *) predict, predict_dims);
 
-    if (predict_nodes == NULL)
-        return -1;
-    for(i=0; i<predict_dims[0]; ++i) {
-        *t = svm_predict(model, &predict_nodes[i], blas_functions);
-        ++t;
+        if (predict_nodes == NULL)
+            return -1;
+        for(npy_intp i=0; i<predict_dims[0]; ++i) {
+            *t = svm_bf16_predict(model, &predict_nodes[i], blas_functions);
+            ++t;
+        }
+        free(predict_nodes);
     }
-    free(predict_nodes);
     return 0;
 }
 
 int copy_predict_values(char *predict, struct svm_model *model,
                         npy_intp *predict_dims, char *dec_values, int nr_class, BlasFunctions *blas_functions)
 {
-    npy_intp i;
-    struct svm_node *predict_nodes;
-    predict_nodes = dense_to_libsvm((double *) predict, predict_dims);
-    if (predict_nodes == NULL)
-        return -1;
-    for(i=0; i<predict_dims[0]; ++i) {
-        svm_predict_values(model, &predict_nodes[i],
-                                ((double *) dec_values) + i*nr_class,
-				blas_functions);
-    }
+    if (model->data_mode == DATA_MODE_FP64) {
+        struct svm_fp64_node *predict_nodes;
+        predict_nodes = dense_to_fp64_libsvm((double *) predict, predict_dims);
+        if (predict_nodes == NULL)
+            return -1;
+        for(npy_intp i=0; i<predict_dims[0]; ++i) {
+            svm_fp64_predict_values(model, &predict_nodes[i],
+                                    ((double *) dec_values) + i*nr_class,
+                    blas_functions);
+        }
 
-    free(predict_nodes);
+        free(predict_nodes);
+    } else {
+        struct svm_bf16_node *predict_nodes;
+        predict_nodes = dense_to_bf16_libsvm((double *) predict, predict_dims);
+        if (predict_nodes == NULL)
+            return -1;
+        for(npy_intp i=0; i<predict_dims[0]; ++i) {
+            svm_bf16_predict_values(model, &predict_nodes[i],
+                                    ((double *) dec_values) + i*nr_class,
+                    blas_functions);
+        }
+
+        free(predict_nodes);
+    }
     return 0;
 }
 
@@ -349,19 +471,36 @@ int copy_predict_values(char *predict, struct svm_model *model,
 int copy_predict_proba(char *predict, struct svm_model *model, npy_intp *predict_dims,
                  char *dec_values, BlasFunctions *blas_functions)
 {
-    npy_intp i, n, m;
-    struct svm_node *predict_nodes;
+    npy_intp n, m;
     n = predict_dims[0];
     m = (npy_intp) model->nr_class;
-    predict_nodes = dense_to_libsvm((double *) predict, predict_dims);
-    if (predict_nodes == NULL)
-        return -1;
-    for(i=0; i<n; ++i) {
-        svm_predict_probability(model, &predict_nodes[i],
-                                ((double *) dec_values) + i*m,
-				blas_functions);
+
+    // Currently only leave it as FP64 mode, TODO for BF16 mode
+    if (model->data_mode == DATA_MODE_FP64) {
+        struct svm_fp64_node *predict_nodes;
+
+        predict_nodes = dense_to_fp64_libsvm((double *) predict, predict_dims);
+        if (predict_nodes == NULL)
+            return -1;
+        for(npy_intp i=0; i<n; ++i) {
+            svm_fp64_predict_probability(model, &predict_nodes[i],
+                                    ((double *) dec_values) + i*m,
+                    blas_functions);
+        }
+        free(predict_nodes);
+    } else {
+        struct svm_bf16_node *predict_nodes;
+
+        predict_nodes = dense_to_bf16_libsvm((double *) predict, predict_dims);
+        if (predict_nodes == NULL)
+            return -1;
+        for(npy_intp i=0; i<n; ++i) {
+            svm_bf16_predict_probability(model, &predict_nodes[i],
+                                    ((double *) dec_values) + i*m,
+                    blas_functions);
+        }
+        free(predict_nodes);
     }
-    free(predict_nodes);
     return 0;
 }
 
@@ -376,7 +515,13 @@ int free_model(struct svm_model *model)
 {
     /* like svm_free_and_destroy_model, but does not free sv_coef[i] */
     if (model == NULL) return -1;
-    free(model->SV);
+    if (model->svm_fp64_SV) {
+        free(model->svm_fp64_SV);
+    }
+
+    if (model->svm_bf16_SV) {
+        free(model->svm_bf16_SV);
+    }
 
     if(model->sv_square){
         free(model->sv_square);
@@ -419,4 +564,23 @@ void set_verbosity(int verbosity_flag){
 		svm_set_print_string_function(&print_string_stdout);
 	else
 		svm_set_print_string_function(&print_null);
+}
+
+int get_sklearn_data_mode()
+{
+    int mode = DATA_MODE_FP64;
+    char* data_mode = getenv("SKLEARN_DATA_MODE"); // Supported mode: BF16, FP64
+    if (data_mode!=NULL) {
+        if (strcmp(data_mode,"BF16") == 0) {        // Set to BF16 mode
+            mode = DATA_MODE_BF16;
+        } else if (strcmp(data_mode,"FP64") == 0) { // Set to FP64 mode
+            mode = DATA_MODE_FP64;
+        } else {                                    // Unrecognized mode, fall back to FP64
+            mode = DATA_MODE_FP64;
+        }
+    } else {                                        // No ENV set, default mode as FP64
+        mode = DATA_MODE_FP64;
+    }
+
+    return mode;
 }
